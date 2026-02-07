@@ -1,0 +1,424 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
+use serde::{Deserialize, Serialize};
+
+use super::projects::AppState;
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Task {
+    pub id: i64,
+    pub project_id: i64,
+    pub column_id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: String,
+    pub sort_order: i64,
+    pub source_tag: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Subtask {
+    pub id: i64,
+    pub task_id: i64,
+    pub title: String,
+    pub done: bool,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskWithDetails {
+    pub id: i64,
+    pub project_id: i64,
+    pub column_id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: String,
+    pub sort_order: i64,
+    pub source_tag: String,
+    pub created_at: String,
+    pub subtasks: Vec<Subtask>,
+    pub tags: Vec<Tag>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskRequest {
+    pub title: String,
+    pub column_id: i64,
+    pub description: Option<String>,
+    pub priority: Option<String>,
+    pub source_tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTaskRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub column_id: Option<i64>,
+    pub priority: Option<String>,
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkUpdateItem {
+    pub id: i64,
+    pub column_id: Option<i64>,
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+struct SubtaskRow {
+    id: i64,
+    task_id: i64,
+    title: String,
+    done: i64,
+    sort_order: i64,
+}
+
+pub async fn create_task(
+    State(state): State<AppState>,
+    Path(project_id): Path<i64>,
+    Json(payload): Json<CreateTaskRequest>,
+) -> Result<(StatusCode, Json<Task>), (StatusCode, Json<ErrorResponse>)> {
+    let column = sqlx::query!(
+        r#"SELECT id, project_id FROM columns WHERE id = ?"#,
+        payload.column_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to verify column: {}", e),
+            }),
+        )
+    })?;
+
+    let column = column.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Column not found".to_string(),
+            }),
+        )
+    })?;
+
+    if column.project_id != project_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Column does not belong to this project".to_string(),
+            }),
+        ));
+    }
+
+    let max_sort_order: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT MAX(sort_order) FROM tasks WHERE column_id = ?"#,
+        payload.column_id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to get max sort order: {}", e),
+            }),
+        )
+    })?;
+
+    let sort_order = max_sort_order.unwrap_or(0) + 1000;
+
+    let priority = payload.priority.unwrap_or_else(|| "medium".to_string());
+    let source_tag = payload.source_tag.unwrap_or_else(|| "manual".to_string());
+
+    let task = sqlx::query_as!(
+        Task,
+        r#"INSERT INTO tasks (project_id, column_id, title, description, priority, sort_order, source_tag)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           RETURNING id as "id!", project_id as "project_id!", column_id as "column_id!", title as "title!", description, priority as "priority!", sort_order as "sort_order!", source_tag as "source_tag!", created_at as "created_at!""#,
+        project_id,
+        payload.column_id,
+        payload.title,
+        payload.description,
+        priority,
+        sort_order,
+        source_tag
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to create task: {}", e),
+            }),
+        )
+    })?;
+
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
+pub async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<TaskWithDetails>, (StatusCode, Json<ErrorResponse>)> {
+    let task = sqlx::query_as!(
+        Task,
+        r#"SELECT id as "id!", project_id as "project_id!", column_id as "column_id!", title as "title!", description, priority as "priority!", sort_order as "sort_order!", source_tag as "source_tag!", created_at as "created_at!"
+           FROM tasks WHERE id = ?"#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to fetch task: {}", e),
+            }),
+        )
+    })?;
+
+    let task = task.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Task not found".to_string(),
+            }),
+        )
+    })?;
+
+    let subtask_rows = sqlx::query_as!(
+        SubtaskRow,
+        r#"SELECT id, task_id, title, done, sort_order FROM subtasks WHERE task_id = ? ORDER BY sort_order"#,
+        id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to fetch subtasks: {}", e),
+            }),
+        )
+    })?;
+
+    let subtasks: Vec<Subtask> = subtask_rows
+        .into_iter()
+        .map(|row| Subtask {
+            id: row.id,
+            task_id: row.task_id,
+            title: row.title,
+            done: row.done != 0,
+            sort_order: row.sort_order,
+        })
+        .collect();
+
+    let tags = sqlx::query_as!(
+        Tag,
+        r#"SELECT t.id as "id!", t.name as "name!", t.color as "color!" FROM tags t
+           INNER JOIN task_tags tt ON t.id = tt.tag_id
+           WHERE tt.task_id = ?"#,
+        id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to fetch tags: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(TaskWithDetails {
+        id: task.id,
+        project_id: task.project_id,
+        column_id: task.column_id,
+        title: task.title,
+        description: task.description,
+        priority: task.priority,
+        sort_order: task.sort_order,
+        source_tag: task.source_tag,
+        created_at: task.created_at,
+        subtasks,
+        tags,
+    }))
+}
+
+pub async fn update_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateTaskRequest>,
+) -> Result<Json<Task>, (StatusCode, Json<ErrorResponse>)> {
+    let existing = sqlx::query_as!(
+        Task,
+        r#"SELECT id as "id!", project_id as "project_id!", column_id as "column_id!", title as "title!", description, priority as "priority!", sort_order as "sort_order!", source_tag as "source_tag!", created_at as "created_at!"
+           FROM tasks WHERE id = ?"#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to fetch task: {}", e),
+            }),
+        )
+    })?;
+
+    let existing = existing.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Task not found".to_string(),
+            }),
+        )
+    })?;
+
+    let title = payload.title.unwrap_or(existing.title);
+    let description = payload.description.or(existing.description);
+    let column_id = payload.column_id.unwrap_or(existing.column_id);
+    let priority = payload.priority.unwrap_or(existing.priority);
+    let sort_order = payload.sort_order.unwrap_or(existing.sort_order);
+
+    let task = sqlx::query_as!(
+        Task,
+        r#"UPDATE tasks SET title = ?, description = ?, column_id = ?, priority = ?, sort_order = ?
+           WHERE id = ?
+           RETURNING id as "id!", project_id as "project_id!", column_id as "column_id!", title as "title!", description, priority as "priority!", sort_order as "sort_order!", source_tag as "source_tag!", created_at as "created_at!""#,
+        title,
+        description,
+        column_id,
+        priority,
+        sort_order,
+        id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to update task: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(task))
+}
+
+pub async fn delete_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let result = sqlx::query!(r#"DELETE FROM tasks WHERE id = ?"#, id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to delete task: {}", e),
+                }),
+            )
+        })?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Task not found".to_string(),
+            }),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn bulk_update_tasks(
+    State(state): State<AppState>,
+    Json(payload): Json<Vec<BulkUpdateItem>>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let mut tx = state.db.begin().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to start transaction: {}", e),
+            }),
+        )
+    })?;
+
+    for item in payload {
+        let existing = sqlx::query!(r#"SELECT id, column_id, sort_order FROM tasks WHERE id = ?"#, item.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to fetch task {}: {}", item.id, e),
+                    }),
+                )
+            })?;
+
+        let existing = existing.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Task {} not found", item.id),
+                }),
+            )
+        })?;
+
+        let column_id = item.column_id.unwrap_or(existing.column_id);
+        let sort_order = item.sort_order.unwrap_or(existing.sort_order);
+
+        sqlx::query!(
+            r#"UPDATE tasks SET column_id = ?, sort_order = ? WHERE id = ?"#,
+            column_id,
+            sort_order,
+            item.id
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update task {}: {}", item.id, e),
+                }),
+            )
+        })?;
+    }
+
+    tx.commit().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to commit transaction: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(StatusCode::OK)
+}
