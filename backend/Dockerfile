@@ -4,9 +4,17 @@ FROM rust:1.85-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Copy schema and create a compile-time DB for sqlx macro verification
+COPY schema.sql ./
+RUN sqlite3 /tmp/build.db < schema.sql
+
+# Set DATABASE_URL at build time so sqlx macros can verify queries
+ENV DATABASE_URL=sqlite:///tmp/build.db
 
 # Cache dependencies — copy manifests first
 COPY Cargo.toml Cargo.lock ./
@@ -20,7 +28,6 @@ RUN mkdir src && \
 
 # Copy real source and rebuild
 COPY src/ src/
-COPY schema.sql ./
 
 # Touch main.rs so cargo doesn't skip rebuild
 RUN touch src/main.rs src/lib.rs && \
